@@ -308,16 +308,20 @@ def classic_binds(m):
                 if idx & INDIRECT_ABS:
                     continue
                 binds.append(local_or_ext(m, idx, a, 0, t == S_LAZY))
-        elif t == S_STUBS and s['r2'] == 8:
-            # __symbol_stub4 (no PIC): ldr pc, [pc, #-4]; .long lazy_ptr
-            for j in range(s['size'] // 8):
-                rebases.add(s['addr'] + j * 8 + 4)
+        elif t == S_STUBS and s['r2'] in (8, 12) and s['seg'] == '__TEXT' and m.u32(s['addr']) in (0xE51FF004, 0xE59FC000):
+            # __symbol_stub4 (no PIC): ldr pc, [pc, #-4]; .long lazy_ptr  |  ldr ip, [pc]; ldr pc, [ip]; .long lazy_ptr
+            n = s['r2']
+            for j in range(s['size'] // n):
+                rebases.add(s['addr'] + j * n + n - 4)
     extreloff, nextrel, locreloff, nlocrel = m.dysym[14], m.dysym[15], m.dysym[16], m.dysym[17]
     for i in range(nextrel):
         addr, info = struct.unpack_from('<iI', d, extreloff + i * 8)
         symnum, pcrel, length, ext, typ = info & 0xFFFFFF, (info >> 24) & 1, (info >> 25) & 3, (info >> 27) & 1, info >> 28
         assert ext and length == 2 and not pcrel and typ == 0, 'reloc externa rara en 0x%x' % addr
-        binds.append(local_or_ext(m, symnum, addr, m.u32(addr), False))
+        b = local_or_ext(m, symnum, addr, m.u32(addr), False)
+        if not b[3]:  # símbolo propio (weak): la palabra ya trae val + addend; sumar val la duplicaba
+            b = (addr, m.u32(addr), False, '')
+        binds.append(b)
     for i in range(nlocrel):
         addr, info = struct.unpack_from('<II', d, locreloff + i * 8)
         if addr & 0x80000000:  # scattered: r_address = 24 bits bajos
@@ -468,6 +472,19 @@ class CodeScan:
         self.funcs = set(known_funcs)
         self.jump_tables = set()
         self.ends = set()  # dirección siguiente a un salto incondicional (posible inicio de función)
+        # stubs de asignadores y de GL/AL: lo que se les pasa es un tamaño o un enum (GL_VERTEX_ARRAY =
+        # 0x8074 cae dentro de __text), nunca un puntero a código
+        self.alloc_stubs = set()
+        iso = m.dysym[12]
+        for s in m.sects:
+            if s['flags'] & 0xFF == S_STUBS and s['r2']:
+                for j in range(s['size'] // s['r2']):
+                    idx = struct.unpack_from('<I', m.d, iso + (s['r1'] + j) * 4)[0]
+                    if not idx & (INDIRECT_LOCAL | INDIRECT_ABS) and (m.syms[idx][0] in (
+                            '__Znwm', '__Znam', '__Znwj', '__Znaj', '_malloc', '_calloc', '_realloc')
+                            or m.syms[idx][0].startswith(('_gl', '_al'))):
+                        self.alloc_stubs.add(s['addr'] + j * s['r2'])
+        self.bl_targets = set()
         self.todo = list(roots)
 
     def run(self):
@@ -543,6 +560,7 @@ class CodeScan:
                     tgt = ops[0].imm
                     mode = thumb ^ (1 if mn == 'blx' else 0)
                     self.funcs.add(tgt | mode)
+                    self.bl_targets.add(tgt & ~1)
                     self.todo.append(tgt | mode)
                 elif mn in ('b', 'cbz', 'cbnz') and ops and ops[-1].type == A.ARM_OP_IMM:
                     self.todo.append(ops[-1].imm | thumb)
@@ -591,6 +609,11 @@ class CodeScan:
                     o.type == A.ARM_OP_REG and o.reg == reg for o in ops[1:]):
                 return 'mul'
             reads = [o for o in ops[1:] if o.type == A.ARM_OP_REG and o.reg == reg]
+            # PIC: add rX, pc, reg / ldr rX, [pc, reg] -> el literal es un desplazamiento, no puntero
+            if reads and any(o.type == A.ARM_OP_REG and o.reg == A.ARM_REG_PC for o in ops[1:]):
+                return 'pcrel'
+            if any(o.type == A.ARM_OP_MEM and o.mem.base == A.ARM_REG_PC and o.mem.index == reg for o in ops):
+                return 'pcrel'
             memuse = [o for o in ops if o.type == A.ARM_OP_MEM and (o.mem.base == reg)]
             if memuse:
                 return 'ptr'
@@ -608,6 +631,8 @@ class CodeScan:
             if mn == 'mov' and reads:
                 return 'move'
             if mn in ('bl', 'blx', 'b'):
+                if ops and ops[0].type == A.ARM_OP_IMM and ops[0].imm in self.alloc_stubs:
+                    return 'int'
                 return 'arg' if reg <= A.ARM_REG_R3 or reg in (A.ARM_REG_R0, A.ARM_REG_R1, A.ARM_REG_R2, A.ARM_REG_R3) else 'unknown'
             if ops and ops[0].type == A.ARM_OP_REG and ops[0].reg == reg and not mn.startswith(('str', 'cmp', 'tst')):
                 return 'dead'  # se sobrescribe sin leerse
@@ -628,7 +653,22 @@ def main():
     if m.dyldinfo and m.pie:
         rebases, binds = dyld_info_tables(m)
         rebases = sorted(set(rebases))
-        rep.append('modo: PIE/dyld_info (exacto)')
+        # binds (sobre todo weak) a símbolos que define el propio binario: van a esa definición
+        defined = {}
+        for name, typ, sect, desc, val in m.syms:
+            if not typ & N_STAB and (typ & N_TYPE) == N_SECT and (typ & 1):
+                defined.setdefault(name, val | (1 if desc & N_ARM_THUMB_DEF else 0))
+        nlocal = 0
+        for i, (a, add, lazy, name) in enumerate(binds):
+            if name in defined:
+                binds[i] = (a, defined[name] + add, lazy, '')
+                nlocal += 1
+        # varios binds al mismo slot (weak + regular): queda el último, como en dyld
+        last = {}
+        for b in binds:
+            last[b[0]] = b
+        binds = list(last.values())
+        rep.append('modo: PIE/dyld_info (exacto); %d binds resueltos dentro de la imagen' % nlocal)
     else:
         binds, exact = classic_binds(m)
         bound = {b[0] for b in binds}
@@ -733,37 +773,58 @@ def main():
             scan.todo.extend(new)
             scan.run()
 
+        # Inicios de función "fuertes": símbolos, IMPs de ObjC, destinos de bl, prólogo ARM. Los
+        # "débiles" (instrucción tras un salto incondicional) solo cuentan con más evidencia.
+        strong = {v & ~1 for v in known} | {v & ~1 for v in imps} | scan.bl_targets
+
+        def is_strong(v):
+            return (v & ~1) in strong or prologue(v & ~1)
+
+        def is_weak(v):
+            return (v & ~1) in scan.ends and (v & ~1) in scan.code and (v & 0xFF) != 0 and (v & 0xFFF0) != 0
+
+        def in_ptr_sect(v):
+            return dlo <= v < dhi or v in cstarts or any(s['addr'] <= v < s['addr'] + s['size'] for s in tconst)
+
         heur = set()
         doubt = []
-        text_ptr_run = set()
-        # corridas de punteros a código (vtables)
+        # vtables: corrida >=2 de punteros a código (todos fuertes o débiles, al menos uno fuerte),
+        # precedida por la cabecera de vtable (0 / puntero a typeinfo) o compuesta solo de fuertes.
+        vt = set()
         run = []
         for a in data_words + [None]:
             v = m.u32(a) if a is not None else 0
-            if a is not None and in_text(v) and (v & 3) == 0 and (looks_func(v) or (v & ~1) in scan.code) and (not run or run[-1] == a - 4):
-                run.append(a)
+            ok = a is not None and in_text(v) and (v & 3) == 0 and (is_strong(v) or is_weak(v))
+            if ok and (not run or run[-1][0] == a - 4):
+                run.append((a, v))
                 continue
             if len(run) >= 2:
-                text_ptr_run.update(run)
-            run = [a] if a is not None and in_text(v) and (v & 3) == 0 and (looks_func(v) or (v & ~1) in scan.code) else []
+                head = m.u32(run[0][0] - 4)
+                header = head == 0 or in_ptr_sect(head)
+                n_strong = sum(1 for _, x in run if is_strong(x))
+                if n_strong == len(run) or (header and n_strong):
+                    vt.update(x for x, _ in run)
+            run = [(a, v)] if ok else []
+        zfill = [s for s in m.sects if s['flags'] & 0xFF in (S_ZEROFILL, S_GB_ZEROFILL)]
         for a in data_words:
             v = m.u32(a)
             if v == 0 or not (m.lo <= v < m.hi):
                 continue
-            if dlo <= v < dhi:
+            # tabla de solo lectura -> bss/common: son dos u16 (HAWX: lbase de zlib = 0x00a30083, ADPCM,
+            # charsets de FreeType); rebasearlos rompe inflate y las fuentes
+            if (any(s['addr'] <= a < s['addr'] + s['size'] for s in tconst)
+                    and any(s['addr'] <= v < s['addr'] + s['size'] for s in zfill)):
+                doubt.append(('tconst->zerofill', a, v))
+                continue
+            if in_ptr_sect(v):
                 heur.add(a)
-            elif v in cstarts:
-                heur.add(a)
-            elif any(s['addr'] <= v < s['addr'] + s['size'] for s in tconst):
-                if v % 4 == 0:
-                    heur.add(a)
-                else:
-                    doubt.append(('data->tconst-unaligned', a, v))
             elif in_text(v):
-                if looks_func(v) or a in text_ptr_run:
+                if is_strong(v) or a in vt:
                     heur.add(a)
                 else:
                     doubt.append(('data->text-nofunc', a, v))
+            else:
+                doubt.append(('data->other', a, v))
         # literales del código
         lit_ptr = set()
         for lit, (use, ipc) in scan.literals.items():
@@ -773,18 +834,26 @@ def main():
             v = m.u32(lit)
             if not (m.lo <= v < m.hi) or v < 0x1000:
                 continue
+            if use == 'pcrel':
+                continue
             if use in ('int', 'mul') and in_text(v):
                 doubt.append(('lit-int-use', lit, v))
                 continue
-            if dlo <= v < dhi or v in cstarts or any(s['addr'] <= v < s['addr'] + s['size'] for s in tconst):
+            if in_ptr_sect(v):
                 # fuera de __text un entero de >1 MB es raro: puntero salvo uso multiplicativo
-                # o valor impar que no es inicio de cadena
-                if use == 'mul' or (use == 'int' and v % 4 and v not in cstarts):
+                # o valor impar que no es inicio de cadena. En __DATA el impar con uso 'int' es un cmp contra
+                # el buffer interno de un string SSO (HAWX: &str + 13; sin rebase -> delete de memoria estática)
+                if use == 'mul' or (use == 'int' and v % 4 and v not in cstarts and not dlo <= v < dhi):
                     doubt.append(('lit-int-use', lit, v))
                 else:
                     lit_ptr.add(lit)
             elif in_text(v):
-                if looks_func(v) or prologue(v & ~1):
+                # < 0x10000 colisiona con enums GL (GL_TEXTURE0 = 0x84c0) y constantes (20000 ms): solo si es
+                # símbolo/IMP/destino de bl, no basta un prólogo casual (HAWX: CCommonGLDriver::setTexture)
+                if v < 0x10000 and (v & ~1) not in strong:
+                    doubt.append(('lit->text-low', lit, v))
+                # función con evidencia fuerte, o débil usada como callback/puntero (no como número)
+                elif is_strong(v) or (is_weak(v) and use in ('arg', 'store', 'move', 'ptr')):
                     lit_ptr.add(lit)
                 else:
                     doubt.append(('lit->text-nofunc', lit, v))
