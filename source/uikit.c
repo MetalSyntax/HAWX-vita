@@ -521,7 +521,8 @@ void ui_touch_event(int finger, int phase, float x, float y) {
     } else {
         t->prev = t->loc;
     }
-    t->loc = (CGPoint){x, y};
+    if (x >= 0) // input.c suelta con (-1,-1): iOS da el último punto (si no, el botón ve "soltado afuera")
+        t->loc = (CGPoint){x, y};
     t->phase = phase;
     t->t = now;
     id set = MSG1(objc_getClass("NSSet"), "setWithObject:", t);
@@ -1032,7 +1033,18 @@ static void ime_start(text_field *f) {
         objc_retain(f);
     }
 }
+static text_field *ime_ret; // Return pendiente: el juego procesa el cambio de texto en drawView antes
+static double ime_ret_at;
 static void ime_poll(void) {
+    if (ime_ret && ns_now() >= ime_ret_at) {
+        text_field *f = ime_ret;
+        ime_ret = NULL;
+        if (f->delegate && objc_responds(f->delegate, sel_registerName("textFieldShouldReturn:")))
+            MSG1(f->delegate, "textFieldShouldReturn:", f);
+        if (f->delegate && objc_responds(f->delegate, sel_registerName("textFieldDidEndEditing:")))
+            MSG1(f->delegate, "textFieldDidEndEditing:", f);
+        objc_release(f);
+    }
     if (!ime_open_now || sceImeDialogGetStatus() != SCE_COMMON_DIALOG_STATUS_FINISHED)
         return;
     SceImeDialogResult r;
@@ -1063,11 +1075,9 @@ static void ime_poll(void) {
         l_info("teclado: \"%s\"", u8);
         ns_post_notification("UITextFieldTextDidChangeNotification", f, NULL);
     }
-    if (f->delegate && objc_responds(f->delegate, sel_registerName("textFieldShouldReturn:")))
-        MSG1(f->delegate, "textFieldShouldReturn:", f);
-    if (f->delegate && objc_responds(f->delegate, sel_registerName("textFieldDidEndEditing:")))
-        MSG1(f->delegate, "textFieldDidEndEditing:", f);
-    objc_release(f);
+    // ponytail: 0.5 s > intervalo del timer de drawView más lento visto (0.2 s); si un juego usa uno más lento, subirlo
+    ime_ret = f; // hereda el retain de ime_start
+    ime_ret_at = ns_now() + 0.5;
 }
 static id tf_initWithFrame(text_field *self, SEL _c, CGRect r) {
     v_initWithFrame(self, _c, r);

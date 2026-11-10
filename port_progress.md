@@ -111,3 +111,17 @@ Un revisor aparte leyó asm.S/objc.c/macho.c. Se corrigió:
   de UIDevice/UIInterface). Se revirtió el cambio de signo del acelerómetro (el original era el físico).
 - Teclado: sceImeDialog funcionaba ("Wonder"), pero HAWX espera `textField:shouldChangeCharactersInRange:
   replacementString:` en el delegate (marca un flag y luego lee `text`). Ahora se llama al confirmar.
+
+### Corrida 15 — nombre de perfil rechazado, menú a 5 FPS
+- Síntoma: tras escribir el nombre, el menú queda con "editar nombre"/"reiniciar", 5 FPS, sin respuesta táctil.
+- Log: `NSTimer 0.2000s -> drawView` (HawxGame::SetMaxFrameRate(5) al abrir el teclado) y nunca vuelve a 40.
+- Causa: `ProfileMenu::OnEnterPressed` valida el nombre que guarda `OnTextChanged`, que corre en `drawView`
+  (flag puesto por `shouldChangeCharacters`). Llamábamos `textFieldShouldReturn:` en el mismo tick → nombre
+  vacío → `CKeyboard::SetText("")`, queda en el teclado.
+- Fix (`uikit.c` ime_poll): el Return/DidEndEditing se entrega 0.5 s después del texto.
+
+### Corrida 16 — perfil creado; el botón "siguiente" se marca pero no actúa
+- El fix de la corrida 15 funcionó: Profile_0 guardado, timer vuelve a 0.025 s.
+- Causa: `input.c` suelta el dedo con (-1,-1) y `ui_touch_event` lo copiaba a `locationInView:`; el reproductor
+  SWF (`touchesChanged` → 0x774f50) veía el "up" fuera del botón → sin click.
+- Fix (`uikit.c` ui_touch_event): en ended sin coordenadas se conserva el último punto, como iOS.
